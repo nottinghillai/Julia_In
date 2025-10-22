@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""
+PyQt5-based multi-agent, layered summarization & refinement GUI for Ollama LLM,
+with a dark-themed, two-pane layout and a pop-up log window (500×700) that auto-scrolls by default.
+Model: llama3.2:3b
+"""
+
+import sys
+import threading
+import time
+import concurrent.futures
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPlainTextEdit, QTextEdit,
+    QVBoxLayout, QHBoxLayout, QPushButton, QSpinBox, QGroupBox,
+    QFormLayout, QProgressBar, QFrame, QSplitter
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtGui import QPalette, QColor
+from ollama import Client
+
+# ───────────────────────────────────────────────
+# Configuration & Defaults
+# ───────────────────────────────────────────────
+OLLAMA_HOST = 'http://localhost:11434'
+MODEL_NAME = 'llama3.2:3b'
+
+# Final prompt: no mention of intermediate steps
+DEFAULT_FINAL_PROMPT = (
+    "You are the final summarizer. Without referencing how you arrived at your answer or "
+    "mentioning any summaries or intermediate steps, provide the best possible final response "
+    "to the user's original input."
+)
+
+# ───────────────────────────────────────────────
+# Separate Log Window (500×700)
+# ───────────────────────────────────────────────
+class LogWindow(QWidget):
+    """
+    A fixed 500×700 QWidget with a “Pause Auto‐Scroll” button and a QPlainTextEdit
+    that shows the entire pipeline log. Auto‐scrolls by default, but can be paused.
+    """
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Processing Log")
+        self.setFixedSize(500, 700)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        # Pause/Resume Auto-Scroll Button
+        pause_layout = QHBoxLayout()
+        self.pause_button = QPushButton("Pause Auto‐Scroll")
+        self.pause_button.clicked.connect(self.toggle_autoscroll)
+        pause_layout.addWidget(self.pause_button, alignment=Qt.AlignLeft)
+        pause_layout.addStretch()
+        layout.addLayout(pause_layout)
+
+        # Log Output (read-only, dark style)
+        self.log_output = QPlainTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
+
+        # Auto-scroll is on by default
+        self.auto_scroll = True
+
+    def append_log(self, text: str):
+        """
+        Append text to the log. If auto_scroll is True, move cursor to the end.
+        """
+        self.log_output.appendPlainText(text)
+        if self.auto_scroll:
+            cursor = self.log_output.textCursor()
+            cursor.movePosition(cursor.End)
+            self.log_output.setTextCursor(cursor)
+            self.log_output.ensureCursorVisible()
+
+    def toggle_autoscroll(self):
+        """Toggle whether new log entries auto-scroll to the bottom."""
+        self.auto_scroll = not self.auto_scroll
+        if self.auto_scroll:
+            self.pause_button.setText("Pause Auto‐Scroll")
+            # Immediately scroll to bottom
+            cursor = self.log_output.textCursor()
+            cursor.movePosition(cursor.End)
+            self.log_output.setTextCursor(cursor)
+            self.log_output.ensureCursorVisible()
+        else:
+            self.pause_button.setText("Resume Auto‐Scroll")
+
+
+# ───────────────────────────────────────────────
+# Worker Thread: Does the multi-agent pipeline
+# ───────────────────────────────────────────────
+class PipelineWorker(QThread):
+    """
+    QThread that runs the multi-agent, layered summarization & refinement pipeline.
+    Signals:
+      - log_signal (str): detailed logs for each step
+      - finished_signal (str): final refined output
+      - progress_signal (int): percentage progress (0-100)
+      - scores_signal (list of (str, int)): complexity scores per layer+final
+      - timing_signal (str, float): (layer_name, duration) for each layer
+      - total_time_signal (float): total processing time in seconds
+    """
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int)
+    scores_signal = pyqtSignal(list)
+    timing_signal = pyqtSignal(str, float)
+    total_time_signal = pyqtSignal(float)
+
+    def __init__(self, user_input, concurrency, num_layers, final_prompt, parent=None):
+        super().__init__(parent)
+        self.user_input = user_input
+        self.concurrency = concurrency
+        self.num_layers = num_layers
+        self.final_prompt = final_prompt or DEFAULT_FINAL_PROMPT
+        self.client = Client(host=OLLAMA_HOST)
+        self.lock = threading.Lock()
+        self.layer_texts = {}
+        # 2*(#layers + 1) steps = first pass (layers + consolidation) + refinement pass
+        self.total_steps = 2 * (self.num_layers + 1)
+        self.current_step = 0
+
+    def split_input(self, text: str):
+        """Split text by periods into non-empty “chunks.”"""
+        sentences = [s.strip() for s in text.split('.') if s.strip()]
+        return sentences
+
+    def agent_call(self, chunk: str, system_prompt: str):
+        """
+        Call the LLM with a chunk plus a system prompt. Ensure output ≤ 1000 chars.
+        """
+        prompt = f"{system_prompt}\n\nUser Chunk:\n{chunk}"
+        with self.lock:
+            response = self.client.chat(
+                model=MODEL_NAME,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+        content = response.get('message', {}).get('content', '').strip()
+        if len(content) > 1000:
+            content = content[:1000].rstrip() + "..."
+        return content
+
+    def process_layer(self, chunks, concurrency, system_prompt, layer_name):
+        """
+        Process a list of `chunks` in parallel (up to `concurrency` threads).
+        Emit a log entry per chunk. Return list of strings (agent outputs).
+        """
+        results = []
+
+        def task_wrapper(chunk_text):
+            start = time.time()
+            result = self.agent_call(chunk_text, system_prompt)
+            duration = time.time() - start
+            self.log_signal.emit(
+                f"🔹 {layer_name} – chunk processed (⏱ {duration:.1f}s):\n"
+                f"{chunk_text}\n→\n{result}\n"
+            )
+            return result
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {executor.submit(task_wrapper, c): c for c in chunks}
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+
+        return results
+
+    def update_progress(self):
+        """Increment current_step, compute percentage, and emit it."""
+        self.current_step += 1
+        pct = int((self.current_step / self.total_steps) * 100)
+        self.progress_signal.emit(pct)
+
+    def layered_summary(self, text, concurrency, num_layers, final_prompt, pass_name):
+        """
+        Perform `num_layers` rounds of:
+          1) splitting into chunks,
+          2) parallel agent calls per chunk,
+          3) batch-level summaries when multiple outputs in one batch,
+        then one final “consolidation” call per pass.
+        Store each layer’s combined output in self.layer_texts[layer_name].
+        Emit logs, timings, and progress updates.
+        """
+        # 1) Initial split into sentences
+        layer_outputs = self.split_input(text)
+        self.log_signal.emit(f"   • {pass_name}: Starting with {len(layer_outputs)} chunks.")
+
+        for layer_idx in range(num_layers):
+            layer_name = f"{pass_name} – Layer {layer_idx+1}"
+            start_time = time.time()
+            system_prompt = (
+                "You are an agent summarizer. You are processing a single chunk of a document.\n"
+                "Add keywords and core concepts. Be aware you are one of multiple agents.\n"
+                "Output must be concise (under 1000 characters)."
+            )
+            self.log_signal.emit(f"\n🔸 {layer_name}: processing {len(layer_outputs)} chunks...")
+
+            new_outputs = []
+            for i in range(0, len(layer_outputs), concurrency):
+                batch = layer_outputs[i : i + concurrency]
+                self.log_signal.emit(f"   ⏳ {layer_name} – batch {i//concurrency + 1}...")
+                batch_outputs = self.process_layer(batch, concurrency, system_prompt, layer_name)
+
+                # If more than one chunk in this batch, summarize them at batch-level
+                if len(batch_outputs) > 1:
+                    combined = "\n".join(batch_outputs)
+                    batch_summary = self.agent_call(
+                        combined,
+                        "You are summarizing the combined outputs of multiple agents. Keep it concise."
+                    )
+                    self.log_signal.emit(f"   🟡 {layer_name} batch summary:\n{batch_summary}\n")
+                    new_outputs.append(batch_summary)
+                else:
+                    new_outputs.extend(batch_outputs)
+
+            duration = time.time() - start_time
+            combined_layer_output = "\n".join(new_outputs)
+            self.layer_texts[layer_name] = combined_layer_output
+            self.timing_signal.emit(layer_name, duration)
+            self.log_signal.emit(f"✅ {layer_name} complete in {duration:.1f}s. {len(new_outputs)} chunks remain.\n")
+            layer_outputs = new_outputs
+            self.update_progress()
+
+        # 2) Consolidation for this pass
+        cons_name = f"{pass_name} – Consolidation"
+        start_time = time.time()
+        final_input = "\n".join(layer_outputs)
+        self.layer_texts[cons_name] = final_input
+        self.log_signal.emit(f"🔷 {cons_name}: calling final agent with aggregated summaries...")
+        final_output = self.agent_call(
+            f"ORIGINAL INPUT:\n{text}\n\nAGGREGATED SUMMARIES:\n{final_input}",
+            final_prompt
+        )
+        duration = time.time() - start_time
+        self.timing_signal.emit(cons_name, duration)
+        self.log_signal.emit(f"✅ {cons_name} complete in {duration:.1f}s.\n")
+        self.update_progress()
+
+        return final_output
+
+    def score_text(self, text: str, label: str):
+        """
+        Ask the LLM to rate complexity of `text` on a 1–10 scale. Return an integer.
+        Emit a log entry.
+        """
+        prompt = (
+            "Rate the complexity of the following text on a scale from 1 (very simple) "
+            "to 10 (very complex). Only respond with an integer (1–10).\n\n"
+            f"Text:\n{text}"
+        )
+        with self.lock:
+            response = self.client.chat(
+                model=MODEL_NAME,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+        cont = response.get('message', {}).get('content', '').strip()
+        try:
+            score = int(cont)
+            if score < 1 or score > 10:
+                score = 5
+        except:
+            score = 5
+        self.log_signal.emit(f"🏷 Complexity score for {label}: {score}/10\n")
+        return score
+
+    def run(self):
+        overall_start = time.time()
+
+        # 1) First Pass
+        self.log_signal.emit("🟢 Splitting input into chunks...")
+        intermediate = self.layered_summary(
+            text=self.user_input,
+            concurrency=self.concurrency,
+            num_layers=self.num_layers,
+            final_prompt=self.final_prompt,
+            pass_name="First Pass"
+        )
+        self.log_signal.emit(f"\n🔵 Intermediate output from First Pass:\n{intermediate}\n")
+
+        # 2) Refinement Pass
+        self.log_signal.emit("🔄 Starting Refinement Pass on intermediate output...\n")
+        refined = self.layered_summary(
+            text=intermediate,
+            concurrency=self.concurrency,
+            num_layers=self.num_layers,
+            final_prompt=self.final_prompt,
+            pass_name="Refinement Pass"
+        )
+        self.log_signal.emit("✅ Refinement Pass complete.\n")
+
+        total_duration = time.time() - overall_start
+        self.total_time_signal.emit(total_duration)
+
+        # 3) Complexity Scores for each layer + final
+        scores = []
+        for label, txt in self.layer_texts.items():
+            score = self.score_text(txt, label)
+            scores.append((label, score))
+        final_score = self.score_text(refined, "Final Output")
+        scores.append(("Final Output", final_score))
+        self.scores_signal.emit(scores)
+
+        # 4) Emit final result
+        self.finished_signal.emit(refined)
+
+
+# ───────────────────────────────────────────────
+# Main Window: Dark-themed, Two-Pane Layout
+# ───────────────────────────────────────────────
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Agentic LLM Pipeline GUI")
+        self.resize(950, 950)
+
+        # Apply a dark palette (background = #1e1e2f, text = #f0f0f0)
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor("#1e1e2f"))
+        palette.setColor(QPalette.WindowText, QColor("#f0f0f0"))
+        palette.setColor(QPalette.Base, QColor("#2d2d44"))
+        palette.setColor(QPalette.Text, QColor("#f0f0f0"))
+        palette.setColor(QPalette.Button, QColor("#252537"))
+        palette.setColor(QPalette.ButtonText, QColor("#f0f0f0"))
+        self.setPalette(palette)
+
+        # Main layout: horizontal splitter
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(4)
+
+        # ───────────────────────────────────────────────
+        # LEFT PANE: Input + Controls
+        # ───────────────────────────────────────────────
+        left_pane = QWidget()
+        left_layout = QVBoxLayout(left_pane)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
+
+        # 1) User Input Group
+        input_group = QGroupBox("📝 User Input")
+        input_group.setStyleSheet("QGroupBox { color: #f0f0f0; }")
+        input_layout = QVBoxLayout()
+        self.input_text = QTextEdit()
+        self.input_text.setStyleSheet(
+            "background-color: #2d2d44; color: #f0f0f0; border: 1px solid #3a3a5e;"
+        )
+        self.input_text.setPlaceholderText("Paste your document here...")
+        input_layout.addWidget(self.input_text)
+
+        send_layout = QHBoxLayout()
+        self.send_button = QPushButton("✉️ Send")
+        self.send_button.clicked.connect(self.on_send_clicked)
+        self.send_button.setStyleSheet("background-color: #30475e; color: #f0f0f0;")
+        self.input_count_label = QLabel("Input Words: 0")
+        self.input_count_label.setStyleSheet("color: #f0f0f0;")
+        send_layout.addWidget(self.send_button, alignment=Qt.AlignLeft)
+        send_layout.addWidget(self.input_count_label, alignment=Qt.AlignLeft)
+        send_layout.addStretch()
+        input_layout.addLayout(send_layout)
+
+        input_group.setLayout(input_layout)
+        left_layout.addWidget(input_group)
+
+        # 2) Pipeline Parameters
+        param_group = QGroupBox("⚙️ Parameters")
+        param_group.setStyleSheet("QGroupBox { color: #f0f0f0; }")
+        param_layout = QFormLayout()
+        self.conc_spinner = QSpinBox()
+        self.conc_spinner.setRange(1, 20)
+        self.conc_spinner.setValue(5)
+        self.conc_spinner.setStyleSheet("background-color: #2d2d44; color: #f0f0f0;")
+        self.layer_spinner = QSpinBox()
+        self.layer_spinner.setRange(1, 10)
+        self.layer_spinner.setValue(2)
+        self.layer_spinner.setStyleSheet("background-color: #2d2d44; color: #f0f0f0;")
+        param_layout.addRow("Parallel Agents:", self.conc_spinner)
+        param_layout.addRow("Summary Layers:", self.layer_spinner)
+        param_group.setLayout(param_layout)
+        left_layout.addWidget(param_group)
+
+        # 3) Final Agent Prompt Editor
+        final_group = QGroupBox("✏️ Final Agent Prompt")
+        final_group.setStyleSheet("QGroupBox { color: #f0f0f0; }")
+        final_layout = QVBoxLayout()
+        self.final_prompt_editor = QPlainTextEdit()
+        self.final_prompt_editor.setStyleSheet(
+            "background-color: #2d2d44; color: #f0f0f0; border: 1px solid #3a3a5e;"
+        )
+        self.final_prompt_editor.setPlainText(DEFAULT_FINAL_PROMPT)
+        final_layout.addWidget(self.final_prompt_editor)
+        self.reset_button = QPushButton("Return to Default")
+        self.reset_button.setStyleSheet("background-color: #30475e; color: #f0f0f0;")
+        self.reset_button.clicked.connect(self.reset_prompt)
+        final_layout.addWidget(self.reset_button, alignment=Qt.AlignRight)
+        final_group.setLayout(final_layout)
+        left_layout.addWidget(final_group)
+
+        # 4) Progress Bar & Timer (aligned bottom-left)
+        progress_container = QWidget()
+        progress_layout = QHBoxLayout(progress_container)
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setStyleSheet(
+            "QProgressBar { background-color: #2d2d44; color: #f0f0f0; border: 1px solid #3a3a5e; }"
+            "QProgressBar::chunk { background-color: #39A000; }"
+        )
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self.timer_label = QLabel("Elapsed Time: 0.0s")
+        self.timer_label.setStyleSheet("color: #f0f0f0;")
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.timer_label)
+        left_layout.addWidget(progress_container)
+
+        # Add left_pane to splitter
+        splitter.addWidget(left_pane)
+
+        # ───────────────────────────────────────────────
+        # RIGHT PANE: “View Log” button + Scores + Final Output
+        # ───────────────────────────────────────────────
+        right_pane = QWidget()
+        right_layout = QVBoxLayout(right_pane)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+        right_layout.setSpacing(8)
+
+        # “View Log” Button (top-right)
+        view_log_layout = QHBoxLayout()
+        self.view_log_button = QPushButton("📄 View Log")
+        self.view_log_button.setStyleSheet("background-color: #30475e; color: #f0f0f0;")
+        self.view_log_button.clicked.connect(self.show_log_window)
+        view_log_layout.addWidget(self.view_log_button, alignment=Qt.AlignRight)
+        right_layout.addLayout(view_log_layout)
+
+        # Layer & Final Complexity Scores
+        score_group = QGroupBox("📊 Complexity Scores")
+        score_group.setStyleSheet("QGroupBox { color: #f0f0f0; }")
+        score_layout = QVBoxLayout()
+        self.score_container = QVBoxLayout()
+        score_layout.addLayout(self.score_container)
+        score_group.setLayout(score_layout)
+        right_layout.addWidget(score_group)
+
+        # Final Output & Word Count
+        output_group = QGroupBox("🎯 Final Output")
+        output_group.setStyleSheet("QGroupBox { color: #f0f0f0; }")
+        output_layout = QVBoxLayout()
+        self.final_output_box = QTextEdit()
+        self.final_output_box.setReadOnly(True)
+        self.final_output_box.setStyleSheet(
+            "background-color: #2d2d44; color: #f0f0f0; border: 1px solid #3a3a5e;"
+        )
+        output_layout.addWidget(self.final_output_box)
+        self.output_count_label = QLabel("Output Words: 0")
+        self.output_count_label.setStyleSheet("color: #f0f0f0;")
+        output_layout.addWidget(self.output_count_label, alignment=Qt.AlignRight)
+        output_group.setLayout(output_layout)
+        right_layout.addWidget(output_group)
+
+        # Add right_pane to splitter
+        splitter.addWidget(right_pane)
+
+        # Left pane = 40% width, Right pane = 60% width initially
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+
+        # Put splitter into main_window’s layout
+        container = QVBoxLayout(self)
+        container.setContentsMargins(0, 0, 0, 0)
+        container.addWidget(splitter)
+
+        # Create the Log Window (hidden initially)
+        self.log_window = LogWindow()
+
+        # Worker thread and timer handle
+        self.worker = None
+        self.start_time = None
+        self.start_timer = None
+
+    def reset_prompt(self):
+        """Reset the final prompt editor to the default text."""
+        self.final_prompt_editor.setPlainText(DEFAULT_FINAL_PROMPT)
+
+    def update_input_word_count(self):
+        """Count words in input and update the label."""
+        text = self.input_text.toPlainText().strip()
+        count = len(text.split()) if text else 0
+        self.input_count_label.setText(f"Input Words: {count}")
+
+    def update_output_word_count(self, text):
+        """Count words in final output and update the label."""
+        count = len(text.split()) if text else 0
+        self.output_count_label.setText(f"Output Words: {count}")
+
+    def append_log(self, text: str):
+        """Forward log text to the Log Window’s append_log()."""
+        self.log_window.append_log(text)
+
+    def update_progress_bar(self, pct: int):
+        """Update the progress bar to the given percentage."""
+        self.progress_bar.setValue(pct)
+
+    def update_timer(self):
+        """Refresh the elapsed-time label every 0.5 seconds."""
+        if self.start_time:
+            elapsed = time.time() - self.start_time
+            self.timer_label.setText(f"Elapsed Time: {elapsed:.1f}s")
+
+    def show_timing(self, layer_name: str, duration: float):
+        """Log how long each layer or consolidation took."""
+        self.append_log(f"⏱ {layer_name} took {duration:.1f} seconds.")
+
+    def display_scores(self, scores: list):
+        """
+        Display complexity scores (1–10) as rows of ten small squares (green/gray)
+        underneath “Complexity Scores.” Each row’s label (e.g., “First Pass – Layer 1:”)
+        is followed by ten boxes.
+        """
+        # Clear any existing rows
+        for i in reversed(range(self.score_container.count())):
+            item = self.score_container.itemAt(i)
+            if item:
+                layout = item.layout()
+                if layout:
+                    while layout.count():
+                        child = layout.takeAt(0)
+                        if child.widget():
+                            child.widget().deleteLater()
+                    self.score_container.removeItem(item)
+
+        # Add a new row per (label, score)
+        for label, score in scores:
+            row_layout = QHBoxLayout()
+            lbl = QLabel(label + ":")
+            lbl.setFixedWidth(200)
+            lbl.setStyleSheet("color: #f0f0f0;")
+            row_layout.addWidget(lbl)
+            for i in range(1, 11):
+                box = QFrame()
+                box.setFixedSize(QSize(15, 15))
+                if i <= score:
+                    box.setStyleSheet("background-color: #39A000; border: 1px solid #000;")
+                else:
+                    box.setStyleSheet("background-color: #444466; border: 1px solid #000;")
+                row_layout.addWidget(box)
+            row_layout.addStretch()
+            self.score_container.addLayout(row_layout)
+
+    def on_send_clicked(self):
+        """
+        When “Send” is clicked:
+        1) Log the raw user input at top of LogWindow
+        2) Update input word count
+        3) Auto-show LogWindow if hidden
+        4) Disable UI controls, start PipelineWorker
+        """
+        user_text = self.input_text.toPlainText().strip()
+        if not user_text:
+            # If no input, log an error
+            self.append_log("⚠️ Error: No input text provided.")
+            return
+
+        # 1) Update word count, log the input
+        self.update_input_word_count()
+        self.log_window.log_output.clear()
+        self.log_window.append_log(f"📝 User Input:\n{user_text}\n")
+        self.log_window.append_log("🚀 Starting pipeline...\n")
+
+        # 2) Input parameters
+        concurrency = self.conc_spinner.value()
+        layers = self.layer_spinner.value()
+        final_prompt = self.final_prompt_editor.toPlainText().strip()
+
+        # 3) Clear final output + reset progress/timer/scores
+        self.final_output_box.clear()
+        self.update_output_word_count("")
+        self.progress_bar.setValue(0)
+        self.timer_label.setText("Elapsed Time: 0.0s")
+        if not self.log_window.isVisible():
+            self.log_window.show()
+
+        # 4) Disable UI controls
+        self.send_button.setEnabled(False)
+        self.conc_spinner.setEnabled(False)
+        self.layer_spinner.setEnabled(False)
+        self.reset_button.setEnabled(False)
+        self.input_text.setEnabled(False)
+
+        # 5) Start the background worker
+        self.worker = PipelineWorker(user_text, concurrency, layers, final_prompt)
+        self.worker.log_signal.connect(self.append_log)
+        self.worker.progress_signal.connect(self.update_progress_bar)
+        self.worker.timing_signal.connect(self.show_timing)
+        self.worker.scores_signal.connect(self.display_scores)
+        self.worker.finished_signal.connect(self.on_pipeline_finished)
+        self.worker.total_time_signal.connect(
+            lambda t: self.append_log(f"⏱ Total processing time: {t:.1f} seconds\n")
+        )
+
+        self.start_time = time.time()
+        # Kick off a timer to update the elapsed time every 0.5 s
+        self.start_timer = threading.Timer(0.5, self.timer_tick)
+        self.start_timer.start()
+
+        self.worker.start()
+
+    def timer_tick(self):
+        """Called every 0.5 s to update the elapsed-time label."""
+        self.update_timer()
+        if self.worker and self.worker.isRunning():
+            self.start_timer = threading.Timer(0.5, self.timer_tick)
+            self.start_timer.start()
+
+    def on_pipeline_finished(self, final_text: str):
+        """Re-enable UI, display final output, and update word count."""
+        self.send_button.setEnabled(True)
+        self.conc_spinner.setEnabled(True)
+        self.layer_spinner.setEnabled(True)
+        self.reset_button.setEnabled(True)
+        self.input_text.setEnabled(True)
+
+        self.final_output_box.setPlainText(final_text)
+        self.update_output_word_count(final_text)
+        self.append_log("✅ Pipeline complete. Final output displayed.\n")
+
+    def show_log_window(self):
+        """Show (or raise) the separate Log Window."""
+        self.log_window.show()
+        self.log_window.raise_()
+        self.log_window.activateWindow()
+
+    def closeEvent(self, event):
+        """Cancel the timer thread if the window closes."""
+        try:
+            if self.start_timer:
+                self.start_timer.cancel()
+        except:
+            pass
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication(sys.argv)
+
+    # Apply the dark palette globally to the application
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor("#1e1e2f"))
+    palette.setColor(QPalette.WindowText, QColor("#f0f0f0"))
+    palette.setColor(QPalette.Base, QColor("#2d2d44"))
+    palette.setColor(QPalette.Text, QColor("#f0f0f0"))
+    palette.setColor(QPalette.Button, QColor("#252537"))
+    palette.setColor(QPalette.ButtonText, QColor("#f0f0f0"))
+    app.setPalette(palette)
+
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
